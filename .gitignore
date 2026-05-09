@@ -1,0 +1,27 @@
+# Secrets
+.env
+credentials.json
+token.json
+
+# OS / IDE
+.DS_Store
+__pycache__/
+*.pyc
+.venv/
+.idea/
+.vscode/
+.claude/
+
+# Atomic-write temp files
+*.tmp
+*.part
+
+# Legacy / superseded
+ocr_pdf.py
+math-*.pdf
+math-*.cache/
+math-*.md
+sotaocr/
+
+# Per-document outputs (large; produced at runtime)
+docs/
