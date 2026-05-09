@@ -39,6 +39,12 @@ RETRY_BASE_DELAY = 2.0
 MIN_TEXT_CHARS_PER_PAGE = 50
 MIN_ALPHA_RATIO = 0.5
 
+# Early-exit during scan: if the first N pages have an alpha_ratio clearly
+# below the threshold, this is a scan or garbled cmap — we'll route to full
+# OCR regardless, no need to walk the remaining pages.
+SCAN_EARLY_EXIT_PAGES = 5
+SCAN_EARLY_EXIT_RATIO = 0.3
+
 # Per-page brokenness threshold — broken_ratio >= this → full OCR
 # (skip the hybrid merge step since it would be mostly OCR anyway).
 HYBRID_FULL_OCR_THRESHOLD = 0.5
@@ -320,33 +326,52 @@ def scan_pdf_text(pdf_path: Path) -> dict:
       - aggregate text-density / readability stats
       - per-page brokenness flag
 
-    Returns a dict with: pages, chars, alpha, avg_per_page, alpha_ratio,
-    text_based, broken (list of (page_num, reason) tuples).
+    Early-exit: after SCAN_EARLY_EXIT_PAGES pages, if alpha_ratio is well
+    below the text threshold, stops the scan — the doc is clearly a scan or
+    has a garbled cmap and will be routed to full OCR anyway.
+
+    Returns a dict with: pages (total), scanned (pages actually examined),
+    chars, alpha, avg_per_page, alpha_ratio, text_based, broken,
+    early_exit (bool).
     """
     total = 0
     alpha_total = 0
-    pages_count = 0
+    scanned = 0
     broken: list[tuple[int, str]] = []
+    early_exit = False
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            pages_count += 1
+        all_pages = list(pdf.pages)
+        page_total = len(all_pages)
+        for page in all_pages:
+            scanned += 1
             text = page.extract_text() or ""
             total += len(text)
             alpha_total += sum(1 for c in text if c.isalpha())
             is_broken, reason = is_page_broken(text)
             if is_broken:
                 broken.append((page.page_number, reason))
-    avg = total / pages_count if pages_count else 0
+            if scanned == SCAN_EARLY_EXIT_PAGES and total > 0:
+                ratio_so_far = alpha_total / total
+                if ratio_so_far < SCAN_EARLY_EXIT_RATIO:
+                    early_exit = True
+                    break
+    avg = total / scanned if scanned else 0
     ratio = alpha_total / total if total else 0
-    text_based = avg >= MIN_TEXT_CHARS_PER_PAGE and ratio >= MIN_ALPHA_RATIO
+    text_based = (
+        not early_exit
+        and avg >= MIN_TEXT_CHARS_PER_PAGE
+        and ratio >= MIN_ALPHA_RATIO
+    )
     return {
-        "pages": pages_count,
+        "pages": page_total,
+        "scanned": scanned,
         "chars": total,
         "alpha": alpha_total,
         "avg_per_page": avg,
         "alpha_ratio": ratio,
         "text_based": text_based,
         "broken": broken,
+        "early_exit": early_exit,
     }
 
 
@@ -756,14 +781,16 @@ def process_pdf(input_path: Path, args: argparse.Namespace) -> Path | None:
     s = scan_pdf_text(pdf_path)
     log_event(
         "##",
-        f"scan file={pdf_path.name} pages={s['pages']} chars={s['chars']} "
-        f"avg={s['avg_per_page']:.1f} alpha_ratio={s['alpha_ratio']:.3f} "
-        f"text_based={s['text_based']} broken={len(s['broken'])}",
+        f"scan file={pdf_path.name} pages={s['pages']} scanned={s['scanned']} "
+        f"chars={s['chars']} avg={s['avg_per_page']:.1f} "
+        f"alpha_ratio={s['alpha_ratio']:.3f} text_based={s['text_based']} "
+        f"broken={len(s['broken'])} early_exit={s['early_exit']}",
     )
+    early_note = " (early-exit: clearly scan)" if s["early_exit"] else ""
     print(
-        f"  scan: {s['pages']} pages, {s['chars']} chars, "
+        f"  scan: {s['scanned']}/{s['pages']} pages, {s['chars']} chars, "
         f"avg={s['avg_per_page']:.1f}/page, alpha_ratio={s['alpha_ratio']:.2f} → "
-        f"{'text-based' if s['text_based'] else 'image-based'}"
+        f"{'text-based' if s['text_based'] else 'image-based'}{early_note}"
     )
 
     if not s["text_based"]:
