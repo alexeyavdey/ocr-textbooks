@@ -107,13 +107,21 @@ def list_children(service, folder_id: str) -> list[dict]:
     return items
 
 
-def walk(service, folder_id: str, parts: list[str]):
-    """Yield (path_parts, file_meta) for every non-folder descendant."""
+def walk(service, folder_id: str, parts: list[str],
+         exclude: set[str] | None = None):
+    """Yield (path_parts, file_meta) for every non-folder descendant.
+
+    `exclude` is a set of lowercased folder names to skip entirely (the
+    folder itself and everything under it).
+    """
+    excl = exclude or set()
     for item in list_children(service, folder_id):
         name = item.get("name", "")
         mt = item.get("mimeType", "")
         if mt == FOLDER_MIME:
-            yield from walk(service, item["id"], parts + [name])
+            if name.lower() in excl:
+                continue
+            yield from walk(service, item["id"], parts + [name], exclude=excl)
         else:
             yield (parts, item)
 
@@ -149,6 +157,9 @@ def parse_args() -> argparse.Namespace:
                    help="List what would be downloaded; touch nothing.")
     p.add_argument("--limit", type=int, default=None,
                    help="Process at most N PDFs (useful for first run).")
+    p.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                   help="Skip a Drive subfolder by exact name (case-insensitive). "
+                   "Repeatable: --exclude 'Начальная школа' --exclude 'Литература'.")
     # Pipeline flags shared with ocr_sotaocr (only the relevant subset).
     p.add_argument("--no-formulas", action="store_true",
                    help="Pass through to OCR pipeline.")
@@ -179,11 +190,15 @@ def main() -> int:
     md5_index = ocr_sotaocr.find_md5_index()
     seen_md5: dict[str, Path] = {}  # md5 → first target_folder this run
 
+    exclude_set = {n.lower() for n in args.exclude}
+    if exclude_set:
+        print(f"Excluding folders: {sorted(args.exclude)}")
+
     pdfs: list[Path] = []
     skipped: list[str] = []
     duplicates: list[str] = []
     seen = 0
-    for parts, item in walk(service, folder_id, []):
+    for parts, item in walk(service, folder_id, [], exclude=exclude_set):
         full_path = "/".join(parts + [item["name"]])
         seen += 1
         if item.get("mimeType") != PDF_MIME:

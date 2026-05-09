@@ -52,6 +52,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--count-pages", action="store_true",
                    help="Download each PDF (or reuse cached copy in docs/) and "
                    "count pages with pdfplumber. Adds page totals to summary.")
+    p.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                   help="Skip a Drive subfolder by exact name (case-insensitive). "
+                   "Repeatable: --exclude 'Начальная школа'.")
     return p.parse_args()
 
 
@@ -62,8 +65,12 @@ def main() -> int:
 
     service = get_service()
 
+    exclude_set = {n.lower() for n in args.exclude}
+    if exclude_set:
+        print(f"Excluding folders: {sorted(args.exclude)}")
+
     items: list[tuple[list[str], dict]] = []
-    for parts, item in walk(service, folder_id, []):
+    for parts, item in walk(service, folder_id, [], exclude=exclude_set):
         items.append((parts, item))
 
     by_mime: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [count, bytes]
