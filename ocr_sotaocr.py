@@ -505,10 +505,34 @@ def ensure_pdf_in_folder(input_path: Path) -> Path:
     return target
 
 
+def find_md5_index() -> dict[str, Path]:
+    """Scan docs/**/info.txt and return {md5_lower: doc_folder}.
+
+    md5 is read from line 4 of info.txt (the convention written by
+    write_info_txt). Folders without a valid info.txt are skipped.
+    """
+    index: dict[str, Path] = {}
+    if not DOCS_DIR.is_dir():
+        return index
+    for info_path in DOCS_DIR.glob("**/info.txt"):
+        try:
+            lines = info_path.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        if len(lines) < 4:
+            continue
+        md5 = lines[3].strip().lower()
+        if len(md5) == 32 and all(c in "0123456789abcdef" for c in md5):
+            index[md5] = info_path.parent
+    return index
+
+
 def write_info_txt(folder: Path, pdf_path: Path,
-                   authors: str | None, title: str | None, grade: str | None) -> Path:
+                   authors: str | None, title: str | None, grade: str | None,
+                   md5: str | None = None) -> Path:
     info_path = folder / "info.txt"
-    md5 = md5_of(pdf_path)
+    if md5 is None:
+        md5 = md5_of(pdf_path)
     if info_path.exists():
         existing = info_path.read_text(encoding="utf-8").splitlines()
         existing = (existing + ["", "", "", ""])[:4]
@@ -682,7 +706,32 @@ def process_pdf(input_path: Path, args: argparse.Namespace) -> Path | None:
     json_path = folder / f"{stem}.json"
     job_path = folder / f"{stem}.job.json"
 
-    write_info_txt(folder, pdf_path, args.authors, args.title, args.grade)
+    # Content-based dedup: if the same PDF (by md5) is already processed in
+    # another folder, we don't want to spend OCR credits twice. Drop a marker
+    # file pointing to the canonical copy.
+    pdf_md5 = md5_of(pdf_path).lower()
+    duplicate_marker = folder / "duplicate.txt"
+    if not args.force:
+        index = find_md5_index()
+        canonical = index.get(pdf_md5)
+        if canonical is not None and canonical.resolve() != folder.resolve():
+            rel_canonical = canonical.relative_to(DOCS_DIR)
+            print(f"  duplicate of {rel_canonical} (md5={pdf_md5[:8]}…)")
+            log_event(
+                "##",
+                f"duplicate file={pdf_path.name} canonical={canonical} md5={pdf_md5}",
+            )
+            write_atomic(
+                duplicate_marker,
+                f"This PDF has the same content as: {rel_canonical}\n"
+                f"md5: {pdf_md5}\n"
+                f"To process anyway, delete this file and re-run with --force.\n",
+            )
+            return None
+    if duplicate_marker.exists() and args.force:
+        duplicate_marker.unlink()
+
+    write_info_txt(folder, pdf_path, args.authors, args.title, args.grade, md5=pdf_md5)
 
     if md_path.exists() and not args.force:
         print(f"  already done → {md_path}")

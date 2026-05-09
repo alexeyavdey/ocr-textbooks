@@ -173,8 +173,15 @@ def main() -> int:
         print(f"Auth failed: {err}", file=sys.stderr)
         return 1
 
+    # Pre-build md5 index of already-processed docs so we can recognise
+    # duplicates that come from Drive under different names without
+    # downloading them again.
+    md5_index = ocr_sotaocr.find_md5_index()
+    seen_md5: dict[str, Path] = {}  # md5 → first target_folder this run
+
     pdfs: list[Path] = []
     skipped: list[str] = []
+    duplicates: list[str] = []
     seen = 0
     for parts, item in walk(service, folder_id, []):
         full_path = "/".join(parts + [item["name"]])
@@ -183,8 +190,30 @@ def main() -> int:
             skipped.append(full_path)
             print(f"  skip non-pdf: {full_path}")
             continue
+
         target = target_for(parts, item["name"])
+        target_folder = target.parent
         rel = target.relative_to(PROJECT_DIR)
+
+        # Drive-side dedup: skip if a content-identical PDF lives at a
+        # different docs/<...>/<stem>/ already, or if we just downloaded
+        # one earlier in this same walk.
+        drive_md5 = (item.get("md5Checksum") or "").lower()
+        if drive_md5 and len(drive_md5) == 32:
+            first_run = seen_md5.get(drive_md5)
+            if first_run is not None and first_run != target_folder:
+                rel_first = first_run.relative_to(PROJECT_DIR)
+                print(f"  dup-in-drive: {full_path} == {rel_first} (md5={drive_md5[:8]}…)")
+                duplicates.append(f"{full_path} == {rel_first}")
+                continue
+            existing = md5_index.get(drive_md5)
+            if existing is not None and existing != target_folder:
+                rel_existing = existing.relative_to(PROJECT_DIR)
+                print(f"  dup-in-docs: {full_path} == {rel_existing} (md5={drive_md5[:8]}…)")
+                duplicates.append(f"{full_path} == {rel_existing}")
+                continue
+            seen_md5[drive_md5] = target_folder
+
         if target.exists():
             print(f"  cached: {rel}")
         elif args.dry_run:
@@ -206,8 +235,12 @@ def main() -> int:
 
     print(
         f"\nSummary: {seen} items inspected, {len(pdfs)} PDF(s) ready, "
-        f"{len(skipped)} non-PDF skipped"
+        f"{len(skipped)} non-PDF skipped, {len(duplicates)} duplicate(s) skipped"
     )
+    if duplicates:
+        print("Duplicates (same content, different names):")
+        for d in duplicates:
+            print(f"  - {d}")
 
     if args.dry_run or args.no_process:
         return 0
