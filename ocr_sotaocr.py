@@ -53,6 +53,16 @@ HYBRID_FULL_OCR_THRESHOLD = 0.5
 PDFPLUMBER_RENDER_DPI = 200
 PDFPLUMBER_SCALE = PDFPLUMBER_RENDER_DPI / 72  # PDF points → render pixels
 
+# Real-table heuristic: pdfplumber's find_tables over-detects on decorative
+# borders / columnar text. A candidate counts as a real table only if every
+# check passes. The page must also reference it ("Таблица N" / "табл. N" /
+# "Table N") — labelled tables are nearly universal in school textbooks.
+TABLE_MIN_DATA_ROWS = 3      # rows with >=2 short filled cells, after trim
+TABLE_MIN_COLS = 2
+TABLE_BBOX_MARGIN = 5        # pt — bbox must fit within the page (with slack)
+TABLE_MAX_CELL_LEN = 200     # cell content longer than this is a paragraph
+_TABLE_REF_RE = re.compile(r"\b(?:табл|table)\w*\.?\s*\d", re.IGNORECASE)
+
 # Formula detection signals (used by is_page_broken / page_formula_score).
 _SUBSCRIPT_CHARS = set("₀₁₂₃₄₅₆₇₈₉")
 _SUPERSCRIPT_CHARS = set("⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -397,6 +407,65 @@ def table_to_markdown(rows: list[list]) -> str:
     return "\n".join([header, sep] + body)
 
 
+def _is_data_row(row: list) -> bool:
+    """A real table row has >= 2 short, filled cells. Long cells (paragraphs
+    that pdfplumber accidentally chunked into the grid when the bbox swallowed
+    a decorative border / surrounding text) disqualify the row."""
+    filled = [c for c in row if c and c.strip()]
+    if len(filled) < 2:
+        return False
+    return all(len(c) <= TABLE_MAX_CELL_LEN for c in filled)
+
+
+def _trim_table_rows(rows: list[list]) -> list[list]:
+    """Trim leading and trailing rows that aren't data rows. Interior rows are
+    preserved even if they fail the heuristic (long cells inside a real table
+    are legitimate; over-extended bboxes only pollute the edges)."""
+    first = next((i for i, r in enumerate(rows) if _is_data_row(r)), None)
+    if first is None:
+        return []
+    last = len(rows) - next(
+        i for i, r in enumerate(reversed(rows)) if _is_data_row(r)
+    )
+    return rows[first:last]
+
+
+def _validated_tables(page, page_text: str) -> list[tuple[list, tuple]]:
+    """Return only real tables on the page, sorted top-to-bottom.
+
+    Filters out pdfplumber's frequent false positives (decorative borders,
+    columnar layouts) by requiring all of:
+      - the page references "Таблица N" / "табл. N" / "Table N";
+      - bbox fits within the page (with small margin);
+      - >= TABLE_MIN_COLS cols;
+      - after trim, >= TABLE_MIN_DATA_ROWS data rows remain.
+    Empty decorative columns (frequent in textbook tables) don't affect the
+    decision because we count rows, not overall fill ratio.
+    """
+    if not _TABLE_REF_RE.search(page_text or ""):
+        return []
+    page_w, page_h = page.width, page.height
+    out: list[tuple[float, list, tuple]] = []
+    for tbl in page.find_tables():
+        rows = tbl.extract()
+        if not rows:
+            continue
+        cols = max(len(r) for r in rows)
+        if cols < TABLE_MIN_COLS:
+            continue
+        x0, y0, x1, y1 = tbl.bbox
+        m = TABLE_BBOX_MARGIN
+        if x0 < -m or y0 < -m or x1 > page_w + m or y1 > page_h + m:
+            continue
+        rows = _trim_table_rows(rows)
+        data_rows = sum(1 for r in rows if _is_data_row(r))
+        if data_rows < TABLE_MIN_DATA_ROWS:
+            continue
+        out.append((y0, rows, tbl.bbox))
+    out.sort(key=lambda x: x[0])
+    return [(rows, bbox) for _, rows, bbox in out]
+
+
 def pdfplumber_to_payload(pdf_path: Path, images_dir: Path) -> dict:
     """Build a sotaocr-shaped JSON payload from a text-based PDF using
     pdfplumber. Same structure as the API result, so render_document and
@@ -413,61 +482,42 @@ def pdfplumber_to_payload(pdf_path: Path, images_dir: Path) -> dict:
             page_num = page.page_number
             page_w = page.width
             page_h = page.height
-            obstacles: list[tuple[float, str, object, tuple]] = []
-            for tbl in page.find_tables():
-                rows = tbl.extract()
-                if rows:
-                    obstacles.append((tbl.bbox[1], "table", rows, tbl.bbox))
-            for img in page.images:
-                bbox_pdf = (img["x0"], img["top"], img["x1"], img["bottom"])
-                obstacles.append((img["top"], "image", None, bbox_pdf))
-            obstacles.sort(key=lambda x: x[0])
+            full_text = (page.extract_text() or "").strip()
+            tables = _validated_tables(page, full_text)
             blocks: list[dict] = []
-            cursor_y = 0.0
-
-            def _add_text_stripe(y_top: float, y_bot: float) -> None:
-                if y_top >= y_bot:
-                    return
-                stripe = page.crop((0, y_top, page_w, y_bot))
-                t = (stripe.extract_text() or "").strip()
-                if not t:
-                    return
+            # Always emit the full page text. Carving stripes around table
+            # bboxes is fragile because pdfplumber routinely extends a table's
+            # bbox to include decorative ruled borders, swallowing surrounding
+            # paragraphs. Real tables are added as extra blocks; cell content
+            # appears twice (linearised in text + md-formatted in the table)
+            # but no paragraph is ever lost.
+            if full_text:
                 blocks.append({
-                    "id": str(len(blocks)),
+                    "id": "0",
                     "type": "text",
-                    "bbox": [
-                        0,
-                        int(y_top * scale),
-                        int(page_w * scale),
-                        int(y_bot * scale),
-                    ],
-                    "content": t,
-                    "order": len(blocks) + 1,
+                    "bbox": [0, 0, int(page_w * scale), int(page_h * scale)],
+                    "content": full_text,
+                    "order": 1,
                 })
-
-            for _, kind, payload, bbox_pdf in obstacles:
-                _add_text_stripe(cursor_y, bbox_pdf[1])
-                bbox_render = [int(c * scale) for c in bbox_pdf]
-                if kind == "table":
-                    md = table_to_markdown(payload)  # type: ignore[arg-type]
-                    if md:
-                        blocks.append({
-                            "id": str(len(blocks)),
-                            "type": "table",
-                            "bbox": bbox_render,
-                            "content": md,
-                            "order": len(blocks) + 1,
-                        })
-                else:
+            for rows, bbox_pdf in tables:
+                md = table_to_markdown(rows)
+                if md:
                     blocks.append({
                         "id": str(len(blocks)),
-                        "type": "image",
-                        "bbox": bbox_render,
-                        "content": "",
+                        "type": "table",
+                        "bbox": [int(c * scale) for c in bbox_pdf],
+                        "content": md,
                         "order": len(blocks) + 1,
                     })
-                cursor_y = max(cursor_y, bbox_pdf[3])
-            _add_text_stripe(cursor_y, page_h)
+            for img in page.images:
+                bbox_pdf = (img["x0"], img["top"], img["x1"], img["bottom"])
+                blocks.append({
+                    "id": str(len(blocks)),
+                    "type": "image",
+                    "bbox": [int(c * scale) for c in bbox_pdf],
+                    "content": "",
+                    "order": len(blocks) + 1,
+                })
             has_images = any(b["type"] == "image" for b in blocks)
             if has_images:
                 preview_path = images_dir / f"p{page_num}_preview.png"
