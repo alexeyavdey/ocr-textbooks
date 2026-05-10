@@ -108,21 +108,36 @@ def list_children(service, folder_id: str) -> list[dict]:
 
 
 def walk(service, folder_id: str, parts: list[str],
-         exclude: set[str] | None = None):
+         exclude: set[str] | None = None,
+         include: set[str] | None = None):
     """Yield (path_parts, file_meta) for every non-folder descendant.
 
     `exclude` is a set of lowercased folder names to skip entirely (the
     folder itself and everything under it).
+
+    `include` is a set of lowercased folder names. When provided, only
+    *top-level* subfolders matching one of these names are descended into;
+    everything else at the root (other folders, root-level files) is
+    skipped. Once inside an included folder, the walk proceeds normally.
+    Use this to scope a run to one subject without changing the target
+    paths in docs/ — pairs cleanly with the existing md5 dedup.
     """
     excl = exclude or set()
+    inc = include or set()
+    at_root = not parts
     for item in list_children(service, folder_id):
         name = item.get("name", "")
         mt = item.get("mimeType", "")
         if mt == FOLDER_MIME:
             if name.lower() in excl:
                 continue
-            yield from walk(service, item["id"], parts + [name], exclude=excl)
+            if inc and at_root and name.lower() not in inc:
+                continue
+            yield from walk(service, item["id"], parts + [name],
+                            exclude=excl, include=inc)
         else:
+            if inc and at_root:
+                continue
             yield (parts, item)
 
 
@@ -160,6 +175,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude", action="append", default=[], metavar="NAME",
                    help="Skip a Drive subfolder by exact name (case-insensitive). "
                    "Repeatable: --exclude 'Начальная школа' --exclude 'Литература'.")
+    p.add_argument("--include", action="append", default=[], metavar="NAME",
+                   help="Process only the named top-level subfolder(s) of the "
+                   "given Drive folder (case-insensitive). Repeatable. "
+                   "Pass the ROOT URL — paths in docs/ stay consistent with "
+                   "earlier runs (avoids the md5-dup-different-folder trap).")
     # Pipeline flags shared with ocr_sotaocr (only the relevant subset).
     p.add_argument("--no-formulas", action="store_true",
                    help="Pass through to OCR pipeline.")
@@ -191,14 +211,18 @@ def main() -> int:
     seen_md5: dict[str, Path] = {}  # md5 → first target_folder this run
 
     exclude_set = {n.lower() for n in args.exclude}
+    include_set = {n.lower() for n in args.include}
     if exclude_set:
         print(f"Excluding folders: {sorted(args.exclude)}")
+    if include_set:
+        print(f"Including only top-level folders: {sorted(args.include)}")
 
     pdfs: list[Path] = []
     skipped: list[str] = []
     duplicates: list[str] = []
     seen = 0
-    for parts, item in walk(service, folder_id, [], exclude=exclude_set):
+    for parts, item in walk(service, folder_id, [], exclude=exclude_set,
+                            include=include_set):
         full_path = "/".join(parts + [item["name"]])
         seen += 1
         if item.get("mimeType") != PDF_MIME:

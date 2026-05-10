@@ -55,6 +55,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--exclude", action="append", default=[], metavar="NAME",
                    help="Skip a Drive subfolder by exact name (case-insensitive). "
                    "Repeatable: --exclude 'Начальная школа'.")
+    p.add_argument("--include", action="append", default=[], metavar="NAME",
+                   help="Inventory only the named top-level subfolder(s) of "
+                   "the Drive folder (case-insensitive). Repeatable.")
     return p.parse_args()
 
 
@@ -66,11 +69,15 @@ def main() -> int:
     service = get_service()
 
     exclude_set = {n.lower() for n in args.exclude}
+    include_set = {n.lower() for n in args.include}
     if exclude_set:
         print(f"Excluding folders: {sorted(args.exclude)}")
+    if include_set:
+        print(f"Including only top-level folders: {sorted(args.include)}")
 
     items: list[tuple[list[str], dict]] = []
-    for parts, item in walk(service, folder_id, [], exclude=exclude_set):
+    for parts, item in walk(service, folder_id, [], exclude=exclude_set,
+                            include=include_set):
         items.append((parts, item))
 
     by_mime: dict[str, list[int]] = defaultdict(lambda: [0, 0])  # [count, bytes]
