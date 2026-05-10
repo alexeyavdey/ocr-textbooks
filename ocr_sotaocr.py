@@ -28,8 +28,12 @@ UPLOAD_TIMEOUT_SECONDS = 300
 
 # HTTP retry settings (transient 5xx + network errors).
 RETRY_STATUSES = {502, 503, 504}
-RETRY_MAX_ATTEMPTS = 4
+RETRY_MAX_ATTEMPTS = 4         # default for upload/result/balance
+RETRY_MAX_ATTEMPTS_POLL = 12   # GET /jobs/{id} — job is running on sotaocr,
+                               # waiting out a network blip beats abandoning
+                               # work that is 99% done (observed real case).
 RETRY_BASE_DELAY = 2.0
+RETRY_DELAY_CAP = 60.0         # cap exponential backoff at this many seconds
 
 # Pre-OCR text check.
 # A PDF counts as "text-based" only if both thresholds are met:
@@ -130,12 +134,20 @@ def auth_headers() -> dict[str, str]:
 
 # --- HTTP with retry ---------------------------------------------------------
 
-def _http(method: str, url: str, **kwargs) -> requests.Response:
+def _http(method: str, url: str, max_attempts: int = RETRY_MAX_ATTEMPTS,
+          **kwargs) -> requests.Response:
     """HTTP request with exponential backoff on 5xx and network errors.
-    Caller still validates the final response status code."""
+    Caller still validates the final response status code.
+
+    `max_attempts` overrides RETRY_MAX_ATTEMPTS for this single call (used
+    by polling, which can afford to wait longer since the job is already
+    running upstream). Per-attempt backoff is capped by RETRY_DELAY_CAP
+    so a long retry budget doesn't translate into single-sleep blocks of
+    many minutes.
+    """
     last_err: Exception | None = None
     last_resp: requests.Response | None = None
-    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+    for attempt in range(1, max_attempts + 1):
         try:
             resp = requests.request(method, url, **kwargs)
         except (requests.Timeout, requests.ConnectionError) as err:
@@ -146,12 +158,12 @@ def _http(method: str, url: str, **kwargs) -> requests.Response:
                 return resp
             last_err = None
             last_resp = resp
-        if attempt < RETRY_MAX_ATTEMPTS:
-            delay = RETRY_BASE_DELAY * (2 ** (attempt - 1))
+        if attempt < max_attempts:
+            delay = min(RETRY_BASE_DELAY * (2 ** (attempt - 1)), RETRY_DELAY_CAP)
             status = last_resp.status_code if last_resp is not None else "net-err"
             log_event(
                 "##",
-                f"retry {method} {url} attempt={attempt}/{RETRY_MAX_ATTEMPTS} "
+                f"retry {method} {url} attempt={attempt}/{max_attempts} "
                 f"delay={delay:.0f}s status={status}",
             )
             time.sleep(delay)
@@ -215,7 +227,9 @@ def upload_document(pdf_path: Path, page_ranges: list[dict] | None = None) -> di
 
 def get_job(job_id: str) -> dict:
     log_event("->", f"GET /v1/jobs/{job_id}")
-    resp = _http("GET", f"{API_BASE}/jobs/{job_id}", headers=auth_headers(), timeout=30)
+    resp = _http("GET", f"{API_BASE}/jobs/{job_id}",
+                 headers=auth_headers(), timeout=30,
+                 max_attempts=RETRY_MAX_ATTEMPTS_POLL)
     if not resp.ok:
         log_event("<-", f"{resp.status_code} job={job_id} ERROR body={resp.text[:200]}")
         resp.raise_for_status()
