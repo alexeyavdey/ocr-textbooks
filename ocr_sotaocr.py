@@ -63,6 +63,26 @@ TABLE_BBOX_MARGIN = 5        # pt — bbox must fit within the page (with slack)
 TABLE_MAX_CELL_LEN = 200     # cell content longer than this is a paragraph
 _TABLE_REF_RE = re.compile(r"\b(?:табл|table)\w*\.?\s*\d", re.IGNORECASE)
 
+def _release_page_cache(page) -> None:
+    """Free per-page memory pdfplumber accumulates during extract_text() etc.
+
+    Without this, RSS grows ~10 MB per page on long textbooks (a 225-page book
+    peaks at 2.5 GB → OOM on small servers). Two distinct caches:
+      - page._cached_properties: chars/lines/edges/etc. flushed by flush_cache()
+      - page.get_textmap (functools.lru_cache method) — NOT touched by flush_cache;
+        must be cleared explicitly.
+    Combined effect: 2.5 GB → ~330 MB peak on the same book.
+    """
+    try:
+        page.flush_cache()
+    except AttributeError:
+        pass
+    try:
+        page.get_textmap.cache_clear()
+    except AttributeError:
+        pass
+
+
 # Formula detection signals (used by is_page_broken / page_formula_score).
 _SUBSCRIPT_CHARS = set("₀₁₂₃₄₅₆₇₈₉")
 _SUPERSCRIPT_CHARS = set("⁰¹²³⁴⁵⁶⁷⁸⁹")
@@ -365,6 +385,7 @@ def scan_pdf_text(pdf_path: Path) -> dict:
                 if ratio_so_far < SCAN_EARLY_EXIT_RATIO:
                     early_exit = True
                     break
+            _release_page_cache(page)
     avg = total / scanned if scanned else 0
     ratio = alpha_total / total if total else 0
     text_based = (
@@ -528,7 +549,7 @@ def pdfplumber_to_payload(pdf_path: Path, images_dir: Path) -> dict:
             pages_out.append({
                 "page_number": page_num,
                 "status": "completed",
-                "text": (page.extract_text() or "").strip(),
+                "text": full_text,
                 "page_preview": {
                     "content_type": "image/png",
                     "coordinate_space": "local_render",
@@ -537,6 +558,7 @@ def pdfplumber_to_payload(pdf_path: Path, images_dir: Path) -> dict:
                 },
                 "layout_blocks": blocks,
             })
+            _release_page_cache(page)
     inner = {
         "job_id": "pdfplumber-local",
         "page_count": len(pages_out),
