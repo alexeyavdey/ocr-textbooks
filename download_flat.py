@@ -92,15 +92,24 @@ def list_children(service, folder_id: str) -> list[dict]:
     return items
 
 
-def walk_pdfs(service, folder_id: str):
-    """Yield (drive_path, file_meta) for every PDF descendant."""
+def walk_pdfs(service, folder_id: str, exclude: set[str] | None = None):
+    """Yield (drive_path, file_meta) for every PDF descendant.
+
+    `exclude` is a set of lowercased folder names. Any folder whose name
+    matches (at any depth) is skipped entirely.
+    """
+    excl = exclude or set()
+
     def _walk(fid: str, parts: list[str]):
         for item in list_children(service, fid):
+            name = item.get("name", "")
             mt = item.get("mimeType", "")
             if mt == FOLDER_MIME:
-                yield from _walk(item["id"], parts + [item["name"]])
+                if name.lower() in excl:
+                    continue
+                yield from _walk(item["id"], parts + [name])
             elif mt == PDF_MIME:
-                yield ("/".join(parts + [item["name"]]), item)
+                yield ("/".join(parts + [name]), item)
     yield from _walk(folder_id, [])
 
 
@@ -132,6 +141,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("folder", help="Drive folder URL or ID.")
     p.add_argument("--dry-run", action="store_true",
                    help="List what would be downloaded; touch nothing.")
+    p.add_argument("--exclude", action="append", default=[], metavar="NAME",
+                   help="Skip a Drive subfolder by exact name (case-insensitive). "
+                   "Repeatable: --exclude 'Начальная школа' --exclude 'Архив'.")
     return p.parse_args()
 
 
@@ -139,8 +151,11 @@ def main() -> int:
     args = parse_args()
     folder_id = folder_id_from(args.folder)
     cwd = Path.cwd()
+    exclude_set = {n.lower() for n in args.exclude}
     print(f"Drive folder: {folder_id}")
     print(f"Output dir:   {cwd}")
+    if exclude_set:
+        print(f"Excluding:    {sorted(args.exclude)}")
 
     try:
         service = get_service()
@@ -155,7 +170,7 @@ def main() -> int:
     no_md5 = 0
     failed = 0
 
-    for drive_path, item in walk_pdfs(service, folder_id):
+    for drive_path, item in walk_pdfs(service, folder_id, exclude=exclude_set):
         md5 = (item.get("md5Checksum") or "").lower()
         if md5 and len(md5) == 32:
             target = cwd / f"{md5}.pdf"
